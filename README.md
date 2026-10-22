@@ -188,6 +188,8 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
+The watch view (`w`, or `cswap watch`) also shows, under each account's bars, the tokens this machine's Claude Code spent inside that account's **current** 5h and 7d windows — `tokens  5h 12.30M (85.20K out)  ·  7d 99.78M (297.1K out)` — counted as in [Token usage](#token-usage), each window starting at its reset time minus 5 hours / 7 days. Counts refresh every 30 s; only the transcript bytes appended since the last pass are read.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Token usage

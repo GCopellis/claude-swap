@@ -46,9 +46,15 @@ class CswapApp(App):
     # second.
     SNAPSHOT_AGE_NOTE_S = 60.0
 
+    # Token re-count cadence for the watch view. Reads are incremental, so
+    # this is cheap after the first pass; the windows move slowly anyway.
+    TOKENS_INTERVAL_S = 30.0
+
     snapshot: reactive[AccountsSnapshot | None] = reactive(None)
     refresh_status: reactive[str] = reactive("")
     busy: reactive[bool] = reactive(False)
+    # account number → {"five_hour": UsageTotals, "seven_day": UsageTotals}
+    token_windows: reactive[dict] = reactive(dict, always_update=True)
 
     def __init__(
         self,
@@ -70,6 +76,8 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
+        self._token_index = None  # token_usage.TranscriptIndex, created on demand
+        self._tokens_refreshing = False
         # The auto-switch lines, drawn as ticks on the status strip's bars
         # everywhere: the threshold on the 5h row, the weekly line (when
         # set) on the 7d and per-model rows. Missing/invalid settings fall
@@ -206,6 +214,58 @@ class CswapApp(App):
                 parts.append(f"refreshing {format_duration(elapsed)}")
         self.refresh_status = " · ".join(parts)
 
+    # -- token counts per rate-limit window (watch view) -----------------------
+
+    def enable_token_windows(self) -> None:
+        """Start counting tokens per account window; idempotent."""
+        if self._token_index is not None:
+            self._start_tokens_refresh()
+            return
+        from claude_swap.token_usage import TranscriptIndex
+
+        self._token_index = TranscriptIndex()
+        self.set_interval(self.TOKENS_INTERVAL_S, self._start_tokens_refresh)
+        self._start_tokens_refresh()
+
+    def _start_tokens_refresh(self) -> None:
+        if self._tokens_refreshing or self._token_index is None:
+            return
+        self._tokens_refreshing = True
+        self.run_worker(
+            self._tokens_blocking,
+            thread=True,
+            group="tokens",
+            exit_on_error=False,
+            name="token-windows",
+        )
+
+    def _tokens_blocking(self) -> None:
+        from claude_swap import token_usage
+        from claude_swap.paths import get_claude_config_home
+
+        backup_dir = self.switcher.backup_dir
+        now = time.time()
+        records = self._token_index.refresh(
+            token_usage.transcript_roots(get_claude_config_home(), backup_dir), now
+        )
+        snap = self.snapshot
+        accounts = snap.accounts if snap is not None else ()
+        active = snap.active_number if snap is not None else None
+        timeline = token_usage.AccountTimeline(
+            token_usage.parse_switch_timeline(token_usage.read_switch_log(backup_dir)),
+            str(active) if active is not None else None,
+        )
+        starts = {
+            acc.number: token_usage.window_starts(acc.usage.last_good, now)
+            for acc in accounts
+        }
+        windows = token_usage.window_totals(records, timeline, starts)
+        self.call_from_thread(self._apply_token_windows, windows)
+
+    def _apply_token_windows(self, windows: dict) -> None:
+        self._tokens_refreshing = False
+        self.token_windows = windows
+
     def request_refresh(self, *, full: bool = False) -> None:
         if full:
             self._full_next = True
@@ -233,6 +293,8 @@ class CswapApp(App):
                 self.notify(
                     f"{lane.capitalize()} failed: {msg}", severity="warning", timeout=6
                 )
+        elif event.worker.group == "tokens":
+            self._tokens_refreshing = False  # retried next interval
         elif event.worker.group == "action":
             self.busy = False
             self.notify(f"Action failed: {event.worker.error}", severity="error")

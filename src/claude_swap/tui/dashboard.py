@@ -357,6 +357,22 @@ class WatchScreen(AccountListScreen):
         self.watch(self.app, "refresh_status", self._on_refresh_status)
         self.query_one("#list-title", Static).update(self._title_text())
         super().on_mount()
+        # Token counts per rate-limit window: computed off-thread by the app,
+        # only once someone actually opens this view.
+        self.watch(self.app, "token_windows", self._on_token_windows)
+        self.app.enable_token_windows()
+
+    async def _on_snapshot(self, snap: AccountsSnapshot | None) -> None:
+        await super()._on_snapshot(snap)
+        self._on_token_windows(self.app.token_windows)  # rebuilt rows start blank
+        if snap is not None and not self.app.token_windows:
+            # Window starts come from the snapshot: the first count can only
+            # be right once one exists (`cswap watch` mounts before it does).
+            self.app.enable_token_windows()
+
+    def _on_token_windows(self, windows: dict) -> None:
+        for item in self.query_one("#accounts", ListView).query(AccountItem):
+            item.set_tokens(windows.get(item.number))
 
     def _title_text(self) -> str:
         if self._selecting:

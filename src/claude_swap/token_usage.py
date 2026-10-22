@@ -350,6 +350,121 @@ def aggregate(
     return report
 
 
+# --------------------------------------------------------------------------- #
+# Per-account rate-limit windows (TUI watch view)
+# --------------------------------------------------------------------------- #
+
+WINDOW_SPANS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
+
+
+def window_starts(last_good: dict | None, now: float) -> dict[str, float]:
+    """Epoch start of each rate-limit window, from its ``resets_at``.
+
+    A window ends at ``resets_at`` and spans ``WINDOW_SPANS[key]`` before it.
+    A reset already in the past means the window rolled over and the next one
+    opens on first use, so only usage since that reset counts. Without a
+    reset time (window idle, or usage unknown) the rolling span up to ``now``
+    is used.
+    """
+    starts: dict[str, float] = {}
+    for key, span in WINDOW_SPANS.items():
+        start = now - span
+        window = last_good.get(key) if isinstance(last_good, dict) else None
+        reset = _parse_timestamp(window.get("resets_at")) if isinstance(window, dict) else None
+        if reset is not None:
+            reset_ts = reset.timestamp()
+            start = reset_ts - span if reset_ts > now else reset_ts
+        starts[key] = start
+    return starts
+
+
+def window_totals(
+    records: Iterable[UsageRecord],
+    timeline: AccountTimeline,
+    starts_by_account: dict[str, dict[str, float]],
+) -> dict[str, dict[str, UsageTotals]]:
+    """Token totals per account and window: ``{num: {"five_hour": ..., ...}}``."""
+    out = {
+        num: {key: UsageTotals() for key in starts}
+        for num, starts in starts_by_account.items()
+    }
+    for record in records:
+        account = record.slot or timeline.account_at(record.timestamp)
+        starts = starts_by_account.get(account)
+        if not starts:
+            continue
+        ts = record.timestamp.timestamp()
+        for key, start in starts.items():
+            if ts >= start:
+                out[account][key].add(record)
+    return out
+
+
+class TranscriptIndex:
+    """Incremental, de-duplicated usage records for the last ``horizon_s``.
+
+    Transcripts are append-only, so each refresh reads only the bytes added
+    since the previous one (up to the last complete line). The first refresh
+    pays for the whole horizon; later ones cost about what was written since.
+    Not thread-safe: one refresher at a time.
+    """
+
+    def __init__(self, horizon_s: float = WINDOW_SPANS["seven_day"] + 3600):
+        self.horizon_s = horizon_s
+        self._offsets: dict[Path, int] = {}
+        self._seen: dict[str, float] = {}
+        self._records: list[UsageRecord] = []
+
+    def refresh(
+        self, roots: Iterable[tuple[Path, str | None]], now: float
+    ) -> list[UsageRecord]:
+        cutoff = now - self.horizon_s
+        for projects_dir, slot in roots:
+            if not projects_dir.is_dir():
+                continue
+            for transcript in projects_dir.rglob("*.jsonl"):
+                self._read_new(transcript, projects_dir, slot, cutoff)
+        self._records = [r for r in self._records if r.timestamp.timestamp() >= cutoff]
+        self._seen = {k: ts for k, ts in self._seen.items() if ts >= cutoff}
+        return list(self._records)
+
+    def _read_new(
+        self, transcript: Path, projects_dir: Path, slot: str | None, cutoff: float
+    ) -> None:
+        try:
+            stat = transcript.stat()
+        except OSError:
+            return
+        if stat.st_mtime < cutoff:
+            return
+        offset = self._offsets.get(transcript, 0)
+        if stat.st_size < offset:  # rewritten: start over; _seen drops repeats
+            offset = 0
+        if stat.st_size == offset:
+            return
+        try:
+            with transcript.open("rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read()
+        except OSError:
+            return
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return  # only a partial line so far
+        self._offsets[transcript] = offset + end + 1
+        project = _project_name(transcript, projects_dir)
+        for line in chunk[:end].decode("utf-8", errors="replace").splitlines():
+            parsed = parse_transcript_line(line, project, slot)
+            if parsed is None:
+                continue
+            key, record = parsed
+            ts = record.timestamp.timestamp()
+            if key in self._seen or ts < cutoff:
+                continue
+            self._seen[key] = ts
+            self._records.append(record)
+
+
 def window_start(days: int | None, since: date | None) -> datetime | None:
     """Local-midnight start of the window as an aware datetime.
 

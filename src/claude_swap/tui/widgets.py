@@ -16,6 +16,7 @@ from textual.widgets import ListItem, Static
 
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
+from claude_swap.token_usage import UsageTotals, format_tokens
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.switcher import ERROR_NOTES
@@ -392,6 +393,27 @@ class AccountsPanel(Static):
         return text
 
 
+def tokens_line_text(
+    windows: dict[str, UsageTotals], *, palette: Palette = Palette.DARK
+) -> Text:
+    """``tokens  5h 12.3M (85.2K out)  ·  7d 860.1M (2.71M out)`` — the tokens
+    this machine's Claude Code spent inside each current rate-limit window
+    (see ``token_usage.window_totals``)."""
+    text = Text()
+    text.append("tokens", style=palette.muted)
+    first = True
+    for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
+        totals = windows.get(key)
+        if totals is None:
+            continue
+        text.append("  " if first else "  ·  ", style=palette.muted)
+        first = False
+        text.append(f"{label} ", style=palette.muted)
+        text.append(format_tokens(totals.total_tokens), style=palette.foreground)
+        text.append(f" ({format_tokens(totals.output_tokens)} out)", style=palette.muted)
+    return text
+
+
 class AccountCard(Static):
     """One account rendered full-size (used by the switch screen's list)."""
 
@@ -399,16 +421,27 @@ class AccountCard(Static):
         super().__init__()
         self._acc = acc
         self._threshold = threshold
+        self._tokens: dict[str, UsageTotals] | None = None
 
     def set_account(self, acc: AccountSnapshot) -> None:
         self._acc = acc
         self.refresh(layout=True)
 
+    def set_tokens(self, tokens: dict[str, UsageTotals] | None) -> None:
+        """Per-window token totals shown under the bars (watch view only)."""
+        self._tokens = tokens
+        self.refresh(layout=True)
+
     def render(self) -> Text:
-        return account_card_text(
+        palette = Palette.from_theme(self.app.current_theme)
+        text = account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
-            palette=Palette.from_theme(self.app.current_theme),
+            palette=palette,
         )
+        if self._tokens:
+            text.append("\n    ")
+            text.append(tokens_line_text(self._tokens, palette=palette))
+        return text
 
 
 class AccountItem(ListItem):
@@ -423,6 +456,9 @@ class AccountItem(ListItem):
         self.number = acc.number
         self.email = acc.email
         self.query_one(AccountCard).set_account(acc)
+
+    def set_tokens(self, tokens: dict[str, UsageTotals] | None) -> None:
+        self.query_one(AccountCard).set_tokens(tokens)
 
 
 class MenuItem(ListItem):
