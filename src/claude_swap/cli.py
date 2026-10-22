@@ -871,6 +871,7 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cswap auto --autostart y         # resume limit-stopped conversations when quota is back
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -947,6 +948,17 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--autostart",
+        choices=("y", "n"),
+        default=None,
+        help=(
+            "y: once quota is back (after every account ran out, or right "
+            "after a switch), resume the conversations a usage limit stopped, "
+            "via 'claude --bg --resume'. n: never. Default: "
+            "autoswitch.resumePaused (off)"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Evaluate and report, but never switch or write state",
@@ -957,6 +969,8 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Enable debug logging",
     )
     args = parser.parse_args(argv)
+    # merged_with_cli overlays attributes named after the settings fields.
+    args.resume_paused = None if args.autostart is None else args.autostart == "y"
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
     from claude_swap.printer import accent, yellowed
@@ -970,6 +984,8 @@ Defaults live in settings.json in the backup root; flags override them.
         line = event.human()
         if event.kind == "switch":
             line = accent(line)
+        elif event.kind == "session-resumed":
+            line = accent(line) if getattr(event, "ok", False) else yellowed(line)
         elif event.kind in ("error", "account-quarantined"):
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
@@ -1006,6 +1022,7 @@ Defaults live in settings.json in the backup root; flags override them.
                 dimmed(
                     f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
                     f"{weekly}, every {settings.interval_seconds:.0f}s"
+                    f"{', autostart on' if settings.resume_paused else ''}"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )

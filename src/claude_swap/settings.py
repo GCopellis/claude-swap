@@ -67,6 +67,17 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Resume conversations a usage limit stopped, once quota is back (after
+    # an all-exhausted spell, or right after a switch). Opt-in: it spends the
+    # recovered quota and runs agents unattended. See resume.py.
+    resume_paused: bool = False
+    # Prompt sent to each resumed conversation (None = resume.DEFAULT_RESUME_PROMPT).
+    resume_prompt: str | None = None
+    # --permission-mode for the resumed background session ("inherit" = the
+    # user's own Claude Code settings decide).
+    resume_permission_mode: str = "inherit"
+    # At most this many conversations are resumed per pass.
+    resume_max: int = 5
 
 
 @dataclass(frozen=True)
@@ -161,6 +172,23 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "resumePaused", "resume_paused", "bool",
+            help="Resume conversations stopped by a usage limit once quota is back",
+        ),
+        SettingSpec(
+            "autoswitch", "resumePrompt", "resume_prompt", "string",
+            help="Prompt sent to each resumed conversation (unset: built-in prompt)",
+        ),
+        SettingSpec(
+            "autoswitch", "resumePermissionMode", "resume_permission_mode", "choice",
+            choices=("inherit", "acceptEdits", "auto", "dontAsk"),
+            help="Permission mode for resumed background sessions",
+        ),
+        SettingSpec(
+            "autoswitch", "resumeMax", "resume_max", "int", 1, 50,
+            help="Most conversations resumed per pass",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -497,6 +525,10 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("resume_paused", "resume_paused"),
+        ("resume_prompt", "resume_prompt"),
+        ("resume_permission_mode", "resume_permission_mode"),
+        ("resume_max", "resume_max"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

@@ -119,6 +119,25 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
+#### Resume conversations a usage limit stopped (`--autostart`)
+
+```bash
+cswap auto --autostart y    # resume paused conversations once quota is back
+cswap auto --autostart n    # never (the default; or autoswitch.resumePaused)
+```
+
+When a request is rejected for quota, Claude Code ends the turn with a "You've hit your session limit" message and the conversation waits for you. With `--autostart y`, once quota is available again — every account ran out and one recovered (by a switch or by its own reset), or right after a switch — `cswap auto` finds the conversations whose last message is that limit stop and hands each back to Claude Code:
+
+```bash
+claude --bg --resume <session-id> "<resume prompt>"    # run in the conversation's own folder
+```
+
+- The conversation continues in the background under the same session ID: `claude agents` lists it, `claude attach <id>` opens it. If it is still open in a terminal or IDE panel, Claude Code continues a copy and says so — cswap never types into a live session.
+- Only conversations paused up to 6 hours before the accounts ran out are picked up, each pause is resumed once, and at most `autoswitch.resumeMax` (default 5) per pass. `cswap auto --dry-run --autostart y` shows what it would resume.
+- Resumed sessions follow your Claude Code permission settings. `autoswitch.resumePermissionMode` can set `acceptEdits`, `auto` or `dontAsk`; bypassing permissions is deliberately not offered. `autoswitch.resumePrompt` replaces the built-in "continue where you stopped" prompt.
+- The folder must already be trusted by the Claude Code CLI (run `claude` there once and accept). Otherwise the event reports "Workspace not trusted" and that pause is not retried.
+- `claude` is looked up on `PATH`, then in the VS Code / Cursor / Windsurf extension's bundled binary.
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.

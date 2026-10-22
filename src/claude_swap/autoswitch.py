@@ -49,11 +49,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, poll_policy, resume, token_usage
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
 from claude_swap.locking import FileLock
+from claude_swap.paths import get_claude_config_home
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -65,6 +66,12 @@ from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+# A paused conversation is resumed only if it stopped at most this long before
+# the all-exhausted spell began (or before now, after an ordinary switch): the
+# limit usually bites a few turns before cswap notices the fleet is dry.
+RESUME_LOOKBACK_S = 6 * 3600
+# Resumed-pause records older than this are pruned from the state file.
+RESUME_RECORD_TTL_S = 8 * 86400
 
 _logger = logging.getLogger("claude-swap")
 
@@ -492,6 +499,39 @@ class AllExhaustedEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class ResumeEvent(AutoSwitchEvent):
+    """A conversation stopped by a usage limit was handed back to Claude Code
+    (``claude --bg --resume``) now that quota is available."""
+
+    kind: ClassVar[str] = "session-resumed"
+    session_id: str
+    cwd: str
+    paused_at: str
+    ok: bool
+    detail: str = ""
+    dry_run: bool = False
+
+    def _fields(self) -> dict:
+        return {
+            "sessionId": self.session_id,
+            "cwd": self.cwd,
+            "pausedAt": self.paused_at,
+            "ok": self.ok,
+            "detail": self.detail,
+            "dryRun": self.dry_run,
+        }
+
+    def human(self) -> str:
+        short = self.session_id[:8]
+        if self.dry_run:
+            return f"[dry-run] would resume paused conversation {short} in {self.cwd}"
+        if self.ok:
+            tail = f": {self.detail}" if self.detail else ""
+            return f"Resumed paused conversation {short} in {self.cwd}{tail}"
+        return f"could not resume conversation {short} ({self.detail})"
+
+
+@dataclass(frozen=True)
 class SleepEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "sleep"
     seconds: float
@@ -730,6 +770,9 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        resume_launcher: Callable[
+            [resume.PausedSession], resume.ResumeResult
+        ] | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -775,6 +818,11 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # Per-tick facts the paused-conversation resume reads after the
+        # decision: did the fleet run dry, and why was there no switch.
+        self._exhausted_this_tick = False
+        self._last_no_switch_reason: str | None = None
+        self._resume_launcher = resume_launcher or self._launch_resume
 
     # -- state file ---------------------------------------------------------
 
@@ -969,9 +1017,12 @@ class AutoSwitchEngine:
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        self._exhausted_this_tick = False
+        self._last_no_switch_reason = None
         try:
             outcome = self._tick_inner()
             self._persist_health_counters(self._health_account)
+            self._after_tick_resume(outcome)
             return outcome
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
@@ -2665,7 +2716,128 @@ class AutoSwitchEngine:
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
+        if isinstance(event, AllExhaustedEvent):
+            self._exhausted_this_tick = True
+        elif isinstance(event, NoSwitchEvent):
+            self._last_no_switch_reason = event.reason
         self.on_event(event)
+
+    # -- paused-conversation resume ------------------------------------------
+
+    def _after_tick_resume(self, outcome: TickOutcome) -> None:
+        """Track all-exhausted spells and, once quota is back, resume the
+        conversations a usage limit stopped (``settings.resume_paused``).
+
+        Quota is "back" when this tick switched, or when an all-exhausted
+        spell is on record and the active account is below its line again
+        (its own window reset, no switch needed). A plain switch outside a
+        spell also resumes: the active account may have hit its limit before
+        the switch landed. Never raises: resume trouble must not stop the
+        auto-switcher.
+        """
+        if not self.settings.resume_paused:
+            return
+        try:
+            state = self._read_state()
+            spell_start = state.get("exhaustedSince")
+            if self._exhausted_this_tick:
+                if spell_start is None and not self.dry_run:
+                    now = self.clock()
+                    self._mutate_state(lambda s: s.setdefault("exhaustedSince", now))
+                return
+            recovered = outcome is TickOutcome.SWITCHED or (
+                spell_start is not None
+                and outcome is TickOutcome.NO_ACTION
+                and self._last_no_switch_reason == "below-threshold"
+            )
+            if not recovered:
+                return
+            anchor = (
+                spell_start if isinstance(spell_start, (int, float)) else self.clock()
+            )
+            self._resume_paused(anchor - RESUME_LOOKBACK_S, state)
+        except Exception as e:  # pragma: no cover - safety net
+            self._emit(ErrorEvent(message=f"resume: {type(e).__name__}: {e}"))
+
+    def _resume_paused(self, since_ts: float, state: dict) -> None:
+        since = datetime.fromtimestamp(since_ts, timezone.utc)
+        active = self.switcher.current_account_number()
+        roots = [
+            (projects, slot)
+            for projects, slot in token_usage.transcript_roots(
+                get_claude_config_home(), self.switcher.backup_dir
+            )
+            # A `cswap run` profile is bound to its own account; resuming it
+            # only helps when that account is the one with quota now.
+            if slot is None or slot == active
+        ]
+        done = state.get("resumedPauses")
+        done = done if isinstance(done, dict) else {}
+        pending = [
+            s for s in resume.find_paused_sessions(roots, since)
+            if s.pause_uuid not in done
+        ][: self.settings.resume_max]
+
+        results: list[resume.ResumeResult] = []
+        for session in pending:
+            paused_at = session.paused_at.isoformat().replace("+00:00", "Z")
+            if self.dry_run:
+                self._emit(
+                    ResumeEvent(
+                        session_id=session.session_id,
+                        cwd=session.cwd,
+                        paused_at=paused_at,
+                        ok=True,
+                        dry_run=True,
+                    )
+                )
+                continue
+            result = self._resume_launcher(session)
+            results.append(result)
+            self._emit(
+                ResumeEvent(
+                    session_id=session.session_id,
+                    cwd=session.cwd,
+                    paused_at=paused_at,
+                    ok=result.ok,
+                    detail=result.detail,
+                )
+            )
+        if self.dry_run:
+            return
+
+        now = self.clock()
+
+        def record(s: dict) -> None:
+            seen = s.get("resumedPauses")
+            seen = seen if isinstance(seen, dict) else {}
+            # Failed launches are recorded too: a resume that cannot start
+            # (untrusted folder, missing binary) would otherwise be retried
+            # on every switch. The event tells the user what to fix.
+            for r in results:
+                seen[r.session.pause_uuid] = now
+            s["resumedPauses"] = {
+                k: v for k, v in seen.items()
+                if isinstance(v, (int, float)) and now - v < RESUME_RECORD_TTL_S
+            }
+            s.pop("exhaustedSince", None)
+
+        self._mutate_state(record)
+
+    def _launch_resume(self, session: resume.PausedSession) -> resume.ResumeResult:
+        claude_bin = resume.find_claude_binary()
+        if claude_bin is None:
+            return resume.ResumeResult(
+                session, False, "claude executable not found on PATH"
+            )
+        mode = self.settings.resume_permission_mode
+        return resume.resume_session(
+            session,
+            claude_bin,
+            prompt=self.settings.resume_prompt or resume.DEFAULT_RESUME_PROMPT,
+            permission_mode=None if mode == "inherit" else mode,
+            default_config_home=get_claude_config_home(),
+        )
 
     # -- loop -------------------------------------------------------------------
 
