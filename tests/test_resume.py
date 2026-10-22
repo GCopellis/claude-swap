@@ -211,10 +211,11 @@ class TestLaunch:
             "C:/Work/trusted": {"hasTrustDialogAccepted": True},
             "C:/Work/other": {"hasTrustDialogAccepted": False},
         }}), encoding="utf-8")
-        if os.name == "nt":
-            assert resume.folder_trusted("C:\\Work\\trusted", cfg) is True
-            assert resume.folder_trusted("c:\\work\\trusted\\sub", cfg) is True
-            assert resume.folder_trusted("C:\\Work\\other", cfg) is False
+        assert resume.folder_trusted("C:\\Work\\trusted", cfg) is True
+        assert resume.folder_trusted("c:/work/trusted/", cfg) is True
+        # A trusted parent does not cover its subfolders.
+        assert resume.folder_trusted("C:\\Work\\trusted\\sub", cfg) is False
+        assert resume.folder_trusted("C:\\Work\\other", cfg) is False
         assert resume.folder_trusted("/elsewhere", cfg) is False
         assert resume.folder_trusted("/x", tmp_path / "missing.json") is None
 

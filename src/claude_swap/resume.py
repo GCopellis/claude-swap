@@ -257,10 +257,12 @@ def resume_session(
 
 def folder_trusted(cwd: str, global_config: Path) -> bool | None:
     """Best-effort: has the Claude Code CLI trust prompt been accepted for
-    ``cwd`` or one of its parents? None when the config is unreadable.
+    exactly ``cwd``? None when the config is unreadable.
 
-    Informational only (``cswap resume`` listing): the launch itself is the
-    authority, and a wrong guess here never blocks or forces one.
+    Exact folder only: measured with claude 2.1.306, trusting a parent does
+    not let ``--bg`` run in its subfolders. Informational only (``cswap
+    resume`` listing): the launch itself is the authority, and a wrong guess
+    here never blocks or forces one.
     """
     try:
         projects = json.loads(global_config.read_text(encoding="utf-8")).get("projects")
@@ -273,8 +275,4 @@ def folder_trusted(cwd: str, global_config: Path) -> bool | None:
         for k, v in projects.items()
         if isinstance(v, dict) and v.get("hasTrustDialogAccepted") is True
     }
-    path = Path(cwd)
-    for candidate in (path, *path.parents):
-        if str(candidate).replace("\\", "/").rstrip("/").casefold() in trusted:
-            return True
-    return False
+    return cwd.replace("\\", "/").rstrip("/").casefold() in trusted
