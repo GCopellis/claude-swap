@@ -243,4 +243,38 @@ def resume_session(
     except (OSError, subprocess.SubprocessError) as e:
         return ResumeResult(session, False, f"{type(e).__name__}: {e}")
     output = " ".join((proc.stdout or "").split() + (proc.stderr or "").split())
-    return ResumeResult(session, proc.returncode == 0, output[:300])
+    ok = proc.returncode == 0
+    if not ok and "not trusted" in output.lower():
+        # Claude's own hint says "run `claude`", which may not be on PATH
+        # (VS Code users only have the extension's bundled binary).
+        output = (
+            f"folder not trusted by the Claude Code CLI; run \"{claude_bin}\" "
+            f"once in {session.cwd}, accept the trust prompt, then "
+            "'cswap resume --all'"
+        )
+    return ResumeResult(session, ok, output[:400])
+
+
+def folder_trusted(cwd: str, global_config: Path) -> bool | None:
+    """Best-effort: has the Claude Code CLI trust prompt been accepted for
+    ``cwd`` or one of its parents? None when the config is unreadable.
+
+    Informational only (``cswap resume`` listing): the launch itself is the
+    authority, and a wrong guess here never blocks or forces one.
+    """
+    try:
+        projects = json.loads(global_config.read_text(encoding="utf-8")).get("projects")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(projects, dict):
+        return None
+    trusted = {
+        k.replace("\\", "/").rstrip("/").casefold()
+        for k, v in projects.items()
+        if isinstance(v, dict) and v.get("hasTrustDialogAccepted") is True
+    }
+    path = Path(cwd)
+    for candidate in (path, *path.parents):
+        if str(candidate).replace("\\", "/").rstrip("/").casefold() in trusted:
+            return True
+    return False

@@ -135,7 +135,9 @@ claude --bg --resume <session-id> "<resume prompt>"    # run in the conversation
 - The conversation continues in the background under the same session ID: `claude agents` lists it, `claude attach <id>` opens it. If it is still open in a terminal or IDE panel, Claude Code continues a copy and says so — cswap never types into a live session.
 - Only conversations paused up to 6 hours before the accounts ran out are picked up, each pause is resumed once, and at most `autoswitch.resumeMax` (default 5) per pass. `cswap auto --dry-run --autostart y` shows what it would resume.
 - Resumed sessions follow your Claude Code permission settings. `autoswitch.resumePermissionMode` can set `acceptEdits`, `auto` or `dontAsk`; bypassing permissions is deliberately not offered. `autoswitch.resumePrompt` replaces the built-in "continue where you stopped" prompt.
-- The folder must already be trusted by the Claude Code CLI (run `claude` there once and accept). Otherwise the event reports "Workspace not trusted" and that pause is not retried.
+- The folder must already be trusted by the **Claude Code CLI** — trusting it in the VS Code extension is not enough. Run `claude` (or the extension's bundled `claude.exe`, which the error message names) once in that folder and accept the prompt. Otherwise the launch fails with "folder not trusted"; automatic passes retry a failed pause up to 3 times.
+- Every outcome is also written to `claude-swap.log`, so an unattended `cswap auto` leaves a trail.
+- `cswap resume` lists the conversations stopped by a usage limit in the last 24 h (`--hours N`), whether each is pending or failed (and why), and flags folders the CLI does not trust. `cswap resume --all` or `cswap resume <session-id-prefix>` resumes them right away, retrying failed ones regardless of the cap; `--dry-run` only shows.
 - `claude` is looked up on `PATH`, then in the VS Code / Cursor / Windsurf extension's bundled binary.
 
 ### Run multiple accounts at the same time (session mode)

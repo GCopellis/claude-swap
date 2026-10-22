@@ -72,6 +72,10 @@ STATE_SCHEMA_VERSION = 1
 RESUME_LOOKBACK_S = 6 * 3600
 # Resumed-pause records older than this are pruned from the state file.
 RESUME_RECORD_TTL_S = 8 * 86400
+# Automatic passes give up on a pause after this many failed launches (an
+# untrusted folder fails the same way until the user fixes it); `cswap
+# resume` still retries it on demand.
+RESUME_MAX_ATTEMPTS = 3
 
 _logger = logging.getLogger("claude-swap")
 
@@ -2755,11 +2759,14 @@ class AutoSwitchEngine:
             anchor = (
                 spell_start if isinstance(spell_start, (int, float)) else self.clock()
             )
-            self._resume_paused(anchor - RESUME_LOOKBACK_S, state)
+            self.resume_paused_now(anchor - RESUME_LOOKBACK_S, end_spell=True)
         except Exception as e:  # pragma: no cover - safety net
             self._emit(ErrorEvent(message=f"resume: {type(e).__name__}: {e}"))
 
-    def _resume_paused(self, since_ts: float, state: dict) -> None:
+    def paused_conversations(self, since_ts: float) -> list[resume.PausedSession]:
+        """Limit-stopped conversations since ``since_ts`` that this account
+        can resume (default profile, or a `cswap run` profile of the active
+        slot — a profile bound to another account would hit the same wall)."""
         since = datetime.fromtimestamp(since_ts, timezone.utc)
         active = self.switcher.current_account_number()
         roots = [
@@ -2767,16 +2774,44 @@ class AutoSwitchEngine:
             for projects, slot in token_usage.transcript_roots(
                 get_claude_config_home(), self.switcher.backup_dir
             )
-            # A `cswap run` profile is bound to its own account; resuming it
-            # only helps when that account is the one with quota now.
             if slot is None or slot == active
         ]
+        return resume.find_paused_sessions(roots, since)
+
+    def resume_paused_now(
+        self,
+        since_ts: float,
+        *,
+        only: set[str] | None = None,
+        retry_failed: bool = False,
+        end_spell: bool = False,
+    ) -> list[resume.ResumeResult]:
+        """Resume pending paused conversations; returns the launch results.
+
+        A pause is pending until a launch for it succeeded. A failed launch
+        (untrusted folder, missing binary) is retried on later passes, at
+        most ``RESUME_MAX_ATTEMPTS`` times — ``retry_failed`` (the manual
+        ``cswap resume``) ignores that cap. ``only`` restricts the pass to
+        these session ids (prefixes allowed). Every outcome is also written
+        to claude-swap.log: the auto loop may be running unattended.
+        """
+        state = self._read_state()
         done = state.get("resumedPauses")
         done = done if isinstance(done, dict) else {}
-        pending = [
-            s for s in resume.find_paused_sessions(roots, since)
-            if s.pause_uuid not in done
-        ][: self.settings.resume_max]
+        failures = state.get("resumeFailures")
+        failures = failures if isinstance(failures, dict) else {}
+
+        def eligible(s: resume.PausedSession) -> bool:
+            if s.pause_uuid in done:
+                return False
+            if only is not None and not any(s.session_id.startswith(p) for p in only):
+                return False
+            failed = failures.get(s.pause_uuid)
+            attempts = failed.get("attempts", 0) if isinstance(failed, dict) else 0
+            return retry_failed or attempts < RESUME_MAX_ATTEMPTS
+
+        pending = [s for s in self.paused_conversations(since_ts) if eligible(s)]
+        pending = pending[: self.settings.resume_max]
 
         results: list[resume.ResumeResult] = []
         for session in pending:
@@ -2794,6 +2829,16 @@ class AutoSwitchEngine:
                 continue
             result = self._resume_launcher(session)
             results.append(result)
+            if result.ok:
+                _logger.info(
+                    "Resumed paused conversation %s in %s: %s",
+                    session.session_id, session.cwd, result.detail,
+                )
+            else:
+                _logger.warning(
+                    "Could not resume paused conversation %s in %s: %s",
+                    session.session_id, session.cwd, result.detail,
+                )
             self._emit(
                 ResumeEvent(
                     session_id=session.session_id,
@@ -2804,25 +2849,50 @@ class AutoSwitchEngine:
                 )
             )
         if self.dry_run:
-            return
+            return results
 
         now = self.clock()
 
         def record(s: dict) -> None:
             seen = s.get("resumedPauses")
             seen = seen if isinstance(seen, dict) else {}
-            # Failed launches are recorded too: a resume that cannot start
-            # (untrusted folder, missing binary) would otherwise be retried
-            # on every switch. The event tells the user what to fix.
+            failed = s.get("resumeFailures")
+            failed = failed if isinstance(failed, dict) else {}
             for r in results:
-                seen[r.session.pause_uuid] = now
+                key = r.session.pause_uuid
+                if r.ok:
+                    seen[key] = now
+                    failed.pop(key, None)
+                else:
+                    prev = failed.get(key)
+                    attempts = prev.get("attempts", 0) if isinstance(prev, dict) else 0
+                    failed[key] = {
+                        "attempts": attempts + 1,
+                        "at": now,
+                        "sessionId": r.session.session_id,
+                        "detail": r.detail,
+                    }
             s["resumedPauses"] = {
                 k: v for k, v in seen.items()
                 if isinstance(v, (int, float)) and now - v < RESUME_RECORD_TTL_S
             }
-            s.pop("exhaustedSince", None)
+            s["resumeFailures"] = {
+                k: v for k, v in failed.items()
+                if isinstance(v, dict)
+                and isinstance(v.get("at"), (int, float))
+                and now - v["at"] < RESUME_RECORD_TTL_S
+            }
+            if end_spell:
+                s.pop("exhaustedSince", None)
 
         self._mutate_state(record)
+        return results
+
+    def resume_failure(self, pause_uuid: str) -> dict | None:
+        """The recorded failed-launch entry for a pause, if any."""
+        failures = self._read_state().get("resumeFailures")
+        entry = failures.get(pause_uuid) if isinstance(failures, dict) else None
+        return entry if isinstance(entry, dict) else None
 
     def _launch_resume(self, session: resume.PausedSession) -> resume.ResumeResult:
         claude_bin = resume.find_claude_binary()

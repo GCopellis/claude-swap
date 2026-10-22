@@ -726,6 +726,102 @@ Examples:
         )
 
 
+def _resume_command(argv: list[str]) -> None:
+    """Handle `cswap resume [--all | SESSION...] [--hours N] [--dry-run]`.
+
+    Lists Claude Code conversations a usage limit stopped, with what
+    `cswap auto --autostart y` did about each, and resumes them on demand
+    (e.g. after trusting a folder that made the automatic attempt fail).
+    """
+    import dataclasses
+    import time as _time
+    from datetime import datetime
+
+    from claude_swap import resume
+    from claude_swap.autoswitch import AutoSwitchEngine
+    from claude_swap.printer import yellowed
+    from claude_swap.settings import load_settings
+
+    parser = argparse.ArgumentParser(
+        prog="cswap resume",
+        description=(
+            "List conversations stopped by a usage limit and resume them now "
+            "with 'claude --bg --resume' (the same launch `cswap auto "
+            "--autostart y` does when quota comes back)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap resume                 list paused conversations (last 24h)
+  cswap resume --all           resume every one of them now
+  cswap resume 40d930e7        resume one (session id or its prefix)
+  cswap resume --all --dry-run
+        """,
+    )
+    parser.add_argument("sessions", nargs="*", metavar="SESSION",
+                        help="Session id(s) or prefixes to resume")
+    parser.add_argument("--all", action="store_true", help="Resume every paused conversation")
+    parser.add_argument("--hours", type=float, default=24.0, metavar="N",
+                        help="Look back this many hours (default 24)")
+    parser.add_argument("--dry-run", action="store_true", help="Show, never launch")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if args.all and args.sessions:
+        parser.error("pass --all or session ids, not both")
+    if args.hours <= 0:
+        parser.error("--hours must be positive")
+
+    def emit(event) -> None:
+        line = event.human()
+        if event.kind == "session-resumed":
+            line = accent(line) if getattr(event, "ok", False) else yellowed(line)
+        print(f"  {line}")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        settings = dataclasses.replace(load_settings(switcher.backup_dir), resume_max=50)
+        engine = AutoSwitchEngine(switcher, settings, emit, dry_run=args.dry_run)
+        since = _time.time() - args.hours * 3600
+
+        if args.all or args.sessions:
+            results = engine.resume_paused_now(
+                since,
+                only=set(args.sessions) if args.sessions else None,
+                retry_failed=True,
+            )
+            if not results and not args.dry_run:
+                print(dimmed("No matching paused conversation to resume"))
+            return
+
+        paused = engine.paused_conversations(since)
+        if not paused:
+            print(dimmed(f"No conversation stopped by a usage limit in the last {args.hours:g}h"))
+            return
+        global_config = paths.get_global_config_path()
+        print(bolded(f"Paused by a usage limit (last {args.hours:g}h):"))
+        for s in paused:
+            stamp = datetime.fromtimestamp(s.paused_at.timestamp()).strftime("%d/%m %H:%M")
+            failure = engine.resume_failure(s.pause_uuid)
+            if failure:
+                status = yellowed(
+                    f"failed {failure.get('attempts', 1)}x: {failure.get('detail', '')}"
+                )
+            else:
+                status = muted("pending")
+            trusted = resume.folder_trusted(s.cwd, global_config)
+            trust = "" if trusted is not False else yellowed("  [folder not trusted by the CLI]")
+            print(f"  {s.session_id[:8]}  {stamp}  {s.cwd}{trust}")
+            print(f"            {status}")
+        print(dimmed("Resume with 'cswap resume --all' or 'cswap resume <id>'"))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _threshold_command(argv: list[str]) -> None:
     """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
 
@@ -1314,6 +1410,9 @@ def main() -> None:
     if argv and argv[0] == "tokens":
         _tokens_command(argv[1:])
         return
+    if argv and argv[0] == "resume":
+        _resume_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1363,6 +1462,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s tokens [--by GROUP]        tokens used per account/model/day/project
+  %(prog)s resume [--all | <id>]      list / resume conversations a usage limit stopped
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

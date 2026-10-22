@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import cli, resume
+from claude_swap import autoswitch, cli, resume
 from claude_swap.autoswitch import ResumeEvent, TickOutcome
 from claude_swap.resume import (
     DEFAULT_RESUME_PROMPT,
@@ -181,15 +181,42 @@ class TestLaunch:
 
     def test_resume_session_reports_failure(self, tmp_path):
         def runner(argv, **kw):
-            return subprocess.CompletedProcess(
-                argv, 1, stdout="", stderr="Workspace not trusted."
-            )
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
 
         result = resume_session(
             _session(tmp_path), "claude", default_config_home=tmp_path, runner=runner
         )
         assert not result.ok
-        assert "not trusted" in result.detail
+        assert result.detail == "boom"
+
+    def test_untrusted_folder_names_the_real_binary(self, tmp_path):
+        def runner(argv, **kw):
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="",
+                stderr="Workspace not trusted. Run `claude` in X once and accept",
+            )
+
+        result = resume_session(
+            _session(tmp_path), "/opt/ext/claude.exe",
+            default_config_home=tmp_path, runner=runner,
+        )
+        assert not result.ok
+        assert '"/opt/ext/claude.exe"' in result.detail
+        assert str(tmp_path) in result.detail
+        assert "cswap resume --all" in result.detail
+
+    def test_folder_trusted(self, tmp_path):
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"projects": {
+            "C:/Work/trusted": {"hasTrustDialogAccepted": True},
+            "C:/Work/other": {"hasTrustDialogAccepted": False},
+        }}), encoding="utf-8")
+        if os.name == "nt":
+            assert resume.folder_trusted("C:\\Work\\trusted", cfg) is True
+            assert resume.folder_trusted("c:\\work\\trusted\\sub", cfg) is True
+            assert resume.folder_trusted("C:\\Work\\other", cfg) is False
+        assert resume.folder_trusted("/elsewhere", cfg) is False
+        assert resume.folder_trusted("/x", tmp_path / "missing.json") is None
 
     def test_resume_session_missing_cwd(self, tmp_path):
         def runner(argv, **kw):  # pragma: no cover - must not run
@@ -319,16 +346,55 @@ class TestEngineResume:
         h.tick_with_usage({"1": _usage(3), "2": _usage(100, RESET)})
         assert len(h.launched) == 1
 
-    def test_failed_launch_is_not_retried(self, temp_home):
+    def test_failed_launch_is_retried_up_to_the_cap(self, temp_home, caplog):
         h = ResumeHarness(temp_home, resume_paused=True, cooldown_seconds=0.0)
-        h._launch = lambda s: ResumeResult(s, False, "Workspace not trusted.")
-        h.engine = h._make_engine(resume_launcher=h._launch)
+        attempts = []
+
+        def failing(session):
+            attempts.append(session)
+            return ResumeResult(session, False, "folder not trusted")
+
+        h.engine = h._make_engine(resume_launcher=failing)
         h.pause_conversation()
-        h.tick_with_usage({"1": _usage(100, RESET), "2": _usage(3)})
+        with caplog.at_level("WARNING", logger="claude-swap"):
+            h.tick_with_usage({"1": _usage(100, RESET), "2": _usage(3)})
         [event] = h.resumed()
         assert not event.ok
         assert "not trusted" in event.human()
-        assert "p1" in h.state()["resumedPauses"]
+        assert "Could not resume paused conversation sess-1" in caplog.text
+        state = h.state()
+        assert "p1" not in state.get("resumedPauses", {})
+        assert state["resumeFailures"]["p1"]["attempts"] == 1
+
+        flip = ({"1": _usage(3), "2": _usage(100, RESET)},
+                {"1": _usage(100, RESET), "2": _usage(3)})
+        for i in range(4):  # later switches retry until the cap
+            h.clock.advance(600)
+            h.tick_with_usage(flip[i % 2])
+        assert len(attempts) == autoswitch.RESUME_MAX_ATTEMPTS
+        assert h.state()["resumeFailures"]["p1"]["attempts"] == 3
+
+        # The manual path ignores the cap, and success clears the failure.
+        h.engine = h._make_engine(resume_launcher=h._launch)
+        results = h.engine.resume_paused_now(h.clock.now - 3600, retry_failed=True)
+        assert [r.ok for r in results] == [True]
+        state = h.state()
+        assert "p1" in state["resumedPauses"]
+        assert "p1" not in state["resumeFailures"]
+
+    def test_success_is_logged(self, temp_home, caplog):
+        h = ResumeHarness(temp_home, resume_paused=True, cooldown_seconds=0.0)
+        h.pause_conversation()
+        with caplog.at_level("INFO", logger="claude-swap"):
+            h.tick_with_usage({"1": _usage(100, RESET), "2": _usage(3)})
+        assert "Resumed paused conversation sess-1" in caplog.text
+
+    def test_only_filters_by_session_prefix(self, temp_home):
+        h = ResumeHarness(temp_home, resume_paused=True)
+        h.pause_conversation(uuid="pa", sid="aaaa-1")
+        h.pause_conversation(uuid="pb", sid="bbbb-2")
+        h.engine.resume_paused_now(h.clock.now - 3600, only={"bbbb"})
+        assert [s.session_id for s in h.launched] == ["bbbb-2"]
 
     def test_resume_max_caps_a_pass(self, temp_home):
         h = ResumeHarness(temp_home, resume_paused=True, resume_max=2,
@@ -369,6 +435,73 @@ class TestEngineResume:
             {"1": _usage(100, RESET), "2": _usage(3)}
         ) is TickOutcome.SWITCHED
         assert any(e.kind == "error" and "boom" in e.message for e in h.events)
+
+
+class TestResumeCommand:
+    def _pause_now(self, home: Path, sid: str = "sess-cli-1", cwd: Path | None = None) -> None:
+        now = datetime.now(timezone.utc)
+        _write(
+            home / ".claude" / "projects" / "proj" / f"{sid}.jsonl",
+            _user(_iso(now - timedelta(minutes=20)), sid=sid, cwd=str(cwd or home)),
+            _pause(_iso(now - timedelta(minutes=10)), uuid=f"p-{sid}", sid=sid,
+                   cwd=str(cwd or home)),
+        )
+
+    def test_lists_paused_conversations(self, temp_home, capsys):
+        self._pause_now(temp_home)
+        cli._resume_command([])
+        out = capsys.readouterr().out
+        assert "Paused by a usage limit" in out
+        assert "sess-cli" in out
+        assert "pending" in out
+        assert "cswap resume --all" in out
+
+    def test_lists_nothing(self, temp_home, capsys):
+        cli._resume_command(["--hours", "1"])
+        assert "No conversation stopped" in capsys.readouterr().out
+
+    def test_all_launches_and_records(self, temp_home, capsys):
+        self._pause_now(temp_home)
+        launched = []
+
+        def fake_launch(self, session):
+            launched.append(session.session_id)
+            return ResumeResult(session, True, "started bg-1")
+
+        with patch.object(autoswitch.AutoSwitchEngine, "_launch_resume", fake_launch):
+            cli._resume_command(["--all"])
+            assert "Resumed paused conversation" in capsys.readouterr().out
+            cli._resume_command(["--all"])  # already done: nothing left
+        assert launched == ["sess-cli-1"]
+        assert "No matching paused conversation" in capsys.readouterr().out
+
+    def test_failure_shows_in_listing(self, temp_home, capsys):
+        self._pause_now(temp_home)
+
+        def fake_launch(self, session):
+            return ResumeResult(session, False, "folder not trusted by the Claude Code CLI")
+
+        with patch.object(autoswitch.AutoSwitchEngine, "_launch_resume", fake_launch):
+            cli._resume_command(["sess-cli"])
+        capsys.readouterr()
+        cli._resume_command([])
+        assert "failed 1x: folder not trusted" in capsys.readouterr().out
+
+    def test_dry_run_does_not_launch(self, temp_home, capsys):
+        self._pause_now(temp_home)
+        with patch.object(autoswitch.AutoSwitchEngine, "_launch_resume",
+                          side_effect=AssertionError("launched")):
+            cli._resume_command(["--all", "--dry-run"])
+        assert "would resume" in capsys.readouterr().out
+
+    def test_rejects_all_with_ids(self, temp_home):
+        with pytest.raises(SystemExit):
+            cli._resume_command(["--all", "abc"])
+
+    def test_main_dispatches_resume(self, temp_home, capsys):
+        with patch("sys.argv", ["cswap", "resume", "--hours", "1"]):
+            cli.main()
+        assert "No conversation stopped" in capsys.readouterr().out
 
 
 class TestAutostartFlag:
