@@ -576,6 +576,156 @@ Examples:
         sys.exit(130)
 
 
+def _tokens_command(argv: list[str]) -> None:
+    """Handle `cswap tokens [--days N | --since DATE | --all] [--by GROUP] [--json]`.
+
+    Sums the token usage recorded in Claude Code's local transcripts and
+    attributes it to accounts via the switch log (see token_usage.py).
+    Pre-dispatched for the same reason as `alias`.
+    """
+    from datetime import date
+
+    from claude_swap import token_usage
+
+    parser = argparse.ArgumentParser(
+        prog="cswap tokens",
+        description=(
+            "Count the tokens Claude Code used on this machine, per account, "
+            "model, day, or project. Read from local session transcripts; "
+            "accounts are attributed with the switch log."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap tokens                        last 7 days, per account
+  cswap tokens --days 1               today only
+  cswap tokens --by model --days 30
+  cswap tokens --since 2026-10-01 --by day
+  cswap tokens --all --json
+        """,
+    )
+    window = parser.add_mutually_exclusive_group()
+    window.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Last N calendar days including today (default: 7)",
+    )
+    window.add_argument(
+        "--since",
+        type=date.fromisoformat,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Count from this local date onwards",
+    )
+    window.add_argument("--all", action="store_true", help="Count the whole history")
+    parser.add_argument(
+        "--by",
+        choices=token_usage.GROUP_BY_CHOICES,
+        default="account",
+        help="Group rows by this field (default: account)",
+    )
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.days is not None and args.days < 1:
+        parser.error("--days must be at least 1")
+    days = None if (args.all or args.since) else (args.days or 7)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        data = switcher._get_sequence_data() or {}
+        labels: dict[str, str] = {}
+        for num, acc in (data.get("accounts") or {}).items():
+            name = acc.get("alias") or acc.get("email") or ""
+            labels[str(num)] = f"{num}: {name}" if name else str(num)
+        active = data.get("activeAccountNumber")
+
+        timeline = token_usage.AccountTimeline(
+            token_usage.parse_switch_timeline(
+                token_usage.read_switch_log(switcher.backup_dir)
+            ),
+            str(active) if active is not None else None,
+        )
+        start = token_usage.window_start(days, args.since)
+        records = token_usage.iter_records(
+            token_usage.transcript_roots(
+                paths.get_claude_config_home(), switcher.backup_dir
+            ),
+            since=start,
+        )
+        report = token_usage.aggregate(records, args.by, timeline, labels)
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "groupBy": report.group_by,
+                    "since": start.isoformat() if start else None,
+                    "rows": [
+                        {"key": key, **totals.to_json()} for key, totals in report.rows
+                    ],
+                    "total": report.total.to_json(),
+                },
+                indent=2,
+            )
+        )
+        return
+
+    scope = f"since {start.date().isoformat()}" if start is not None else "all history"
+    print(bolded(f"Token usage by {report.group_by} ({scope}):"))
+    if not report.rows:
+        print(dimmed("  No usage recorded in this window"))
+        return
+
+    fmt = token_usage.format_tokens
+
+    def _cells(label: str, t: token_usage.UsageTotals) -> tuple[str, ...]:
+        return (
+            label,
+            str(t.messages),
+            fmt(t.input_tokens),
+            fmt(t.output_tokens),
+            fmt(t.cache_creation_tokens),
+            fmt(t.cache_read_tokens),
+            fmt(t.total_tokens),
+        )
+
+    headers = ("", "msgs", "input", "output", "cache wr", "cache rd", "total")
+    table = [_cells(key, totals) for key, totals in report.rows]
+    footer = _cells("Total", report.total)
+    widths = [max(len(row[i]) for row in (headers, *table, footer)) for i in range(7)]
+
+    def _line(row: tuple[str, ...]) -> str:
+        cells = [row[0].ljust(widths[0])]
+        cells += [cell.rjust(widths[i]) for i, cell in enumerate(row) if i]
+        return "  " + "  ".join(cells)
+
+    print(muted(_line(headers)))
+    for row in table:
+        print(_line(row))
+    print(accent(_line(footer)))
+    if report.group_by == "account" and not timeline.has_events:
+        print(
+            dimmed(
+                "  No switches in the log: default-profile usage is attributed "
+                "to the active account."
+            )
+        )
+
+
 def _threshold_command(argv: list[str]) -> None:
     """Handle `cswap threshold [NUM|EMAIL|ALIAS] [PCT] [--unset]`.
 
@@ -1144,6 +1294,9 @@ def main() -> None:
     if argv and argv[0] == "threshold":
         _threshold_command(argv[1:])
         return
+    if argv and argv[0] == "tokens":
+        _tokens_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1192,6 +1345,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s tokens [--by GROUP]        tokens used per account/model/day/project
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

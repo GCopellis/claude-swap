@@ -171,6 +171,28 @@ Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usag
 
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
+### Token usage
+
+`cswap tokens` counts the tokens Claude Code actually spent on this machine, read from its local session transcripts (`~/.claude/projects/**/*.jsonl`, plus each `cswap run` session profile):
+
+```bash
+cswap tokens                       # last 7 days, per account
+cswap tokens --days 1              # today
+cswap tokens --by model --days 30  # also: --by day, --by project
+cswap tokens --since 2026-10-01
+cswap tokens --all --json
+```
+
+```
+Token usage by account (since 2026-10-16):
+                       msgs  input  output  cache wr  cache rd   total
+  2: work              2324  4.71K   2.71M     9.90M    847.5M  860.1M
+  1: me@example.com     343    694  360.1K     1.39M    127.0M  128.7M
+  Total                2667  5.40K   3.07M    11.29M    974.5M  988.8M
+```
+
+Session-profile transcripts belong to their slot. Default-profile usage is attributed with the switch history in `claude-swap.log`: each response goes to the account that was active when it was made. The log rotates (1 MB × 3), so usage older than the oldest logged switch is attributed to that switch's *from* account. Only local Claude Code usage is counted — other machines and claude.ai chat are not.
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
@@ -186,6 +208,7 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
+cswap tokens                    # Tokens used per account (see Token usage)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics
