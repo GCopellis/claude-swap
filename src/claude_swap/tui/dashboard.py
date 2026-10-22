@@ -42,6 +42,7 @@ class DashboardScreen(Screen):
     BINDINGS = [
         Binding("s", "open_switch", "Switch accounts"),
         Binding("w", "app.open_watch", "Watch"),
+        Binding("h", "app.open_history", "History"),
         Binding("escape,left", "menu_back", "Back", show=False),
         Binding("q", "app.quit", "Quit"),
         # Power shortcuts; the menu is the discoverable path.
@@ -76,6 +77,7 @@ class DashboardScreen(Screen):
         return [
             ("Switch account…", "switch"),
             ("Watch accounts", "watch"),
+            ("Session history", "history"),
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
@@ -160,6 +162,7 @@ class DashboardScreen(Screen):
         actions: dict[str, Callable[[], None]] = {
             "switch": self.action_open_switch,
             "watch": app.action_open_watch,
+            "history": app.action_open_history,
             "auto": app.action_open_auto,
             "add-login": app.action_add_current,
             "add-token": app.action_add_token,

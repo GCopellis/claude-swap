@@ -455,6 +455,12 @@ class CswapApp(App):
 
     # -- navigation -------------------------------------------------------------
 
+    def action_open_history(self) -> None:
+        from claude_swap.tui.history import HistoryScreen
+
+        if not isinstance(self.screen, HistoryScreen):
+            self.push_screen(HistoryScreen())
+
     def action_refresh_full(self) -> None:
         self.request_refresh(full=True)
         self.notify("Refreshing usage…", timeout=2)

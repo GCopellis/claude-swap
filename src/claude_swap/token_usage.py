@@ -400,6 +400,77 @@ def window_totals(
     return out
 
 
+@dataclass
+class SessionWindow:
+    """One past or current rate-limit window of one account."""
+
+    account: str
+    start: float  # epoch
+    end: float  # epoch; the reset instant when ``exact``
+    exact: bool  # boundaries from a recorded reset, not estimated
+    totals: UsageTotals = field(default_factory=UsageTotals)
+    peak_pct: float | None = None
+
+    @property
+    def tokens_per_pct(self) -> float | None:
+        """Tokens this machine spent per 1% of the limit (needs a peak > 0)."""
+        if not self.peak_pct or self.peak_pct <= 0:
+            return None
+        return self.totals.total_tokens / self.peak_pct
+
+
+def session_history(
+    records: Iterable[UsageRecord],
+    timeline: AccountTimeline,
+    window_key: str,
+    known_resets: dict[str, dict[int, float | None]],
+) -> list[SessionWindow]:
+    """Every window per account, newest first.
+
+    ``known_resets`` maps account → {reset epoch: peak pct or None} (from
+    ``window_history.load_peaks`` plus the live snapshot). A record inside a
+    known window ``[reset - span, reset)`` lands there exactly. Others are
+    grouped the way the limit itself works: a window opens at the first
+    message after the previous one closed and lasts ``span`` — an estimate,
+    since the server may round the start.
+    """
+    span = WINDOW_SPANS[window_key]
+    windows: dict[tuple[str, float], SessionWindow] = {}
+    for account, resets in known_resets.items():
+        for reset, peak in resets.items():
+            windows[(account, float(reset))] = SessionWindow(
+                account, reset - span, float(reset), True, peak_pct=peak
+            )
+    exact_by_account: dict[str, list[SessionWindow]] = {}
+    for w in windows.values():
+        exact_by_account.setdefault(w.account, []).append(w)
+    for ws in exact_by_account.values():
+        ws.sort(key=lambda w: w.start)
+
+    open_estimate: dict[str, SessionWindow] = {}
+    for record in sorted(records, key=lambda r: r.timestamp):
+        account = record.slot or timeline.account_at(record.timestamp)
+        ts = record.timestamp.timestamp()
+        target = next(
+            (w for w in exact_by_account.get(account, ()) if w.start <= ts < w.end),
+            None,
+        )
+        if target is None:
+            current = open_estimate.get(account)
+            if current is None or ts >= current.end:
+                end = ts + span
+                # An estimate never overlaps the next known window.
+                later = [w.start for w in exact_by_account.get(account, ()) if w.start > ts]
+                if later:
+                    end = min(end, min(later))
+                current = SessionWindow(account, ts, end, False)
+                open_estimate[account] = current
+                windows[(account, ts)] = current
+            target = current
+        target.totals.add(record)
+    return sorted(windows.values(), key=lambda w: (-w.start, w.account))
+
+
 class TranscriptIndex:
     """Incremental, de-duplicated usage records for the last ``horizon_s``.
 

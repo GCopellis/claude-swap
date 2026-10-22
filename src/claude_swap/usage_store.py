@@ -36,7 +36,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from claude_swap.locking import FileLock
-from claude_swap import oauth
+from claude_swap import oauth, window_history
 from claude_swap.poll_policy import (
     EDGE_BACKOFF_S,
     EXHAUSTED_INTERVAL_S,
@@ -1174,6 +1174,15 @@ class UsageStore:
                 apply(num, row)
             if accepted:
                 self._write_rows(rows)
+        # Outside the store lock: the peak file has its own, and must never
+        # extend the critical section every collector contends on.
+        readings = {
+            num: outcomes[num].usage
+            for num in accepted
+            if outcomes[num].sentinel is None and outcomes[num].error is None
+        }
+        if readings:
+            window_history.note_usage(self.path.parent, readings, now)
         return accepted
 
     def adopt(

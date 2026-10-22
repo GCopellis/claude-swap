@@ -67,6 +67,19 @@ Screen {
 MenuItem Static { color: $foreground; }
 MenuItem Static.menu-item-muted { color: $secondary; }
 
+/* -- session history ------------------------------------------------------- */
+
+#history-summary {
+    height: auto;
+    padding: 0 3;
+    color: $foreground;
+}
+
+#history {
+    margin: 1 2 0 2;
+    background: $background;
+}
+
 /* -- switch / watch screens --------------------------------------------------- */
 
 #list-title {

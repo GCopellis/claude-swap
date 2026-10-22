@@ -801,6 +801,7 @@ class TestDashboard:
             assert ids == [
                 "switch",
                 "watch",
+                "history",
                 "auto",
                 "add-menu",
                 "disable-menu",
@@ -808,8 +809,8 @@ class TestDashboard:
                 "theme-menu",
                 "quit",
             ]
-            # nest into Add (index 3), then back out with escape
-            await pilot.press("down", "down", "down", "enter")
+            # nest into Add (index 4), then back out with escape
+            await pilot.press("down", "down", "down", "down", "enter")
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
             assert ids == ["add-login", "add-token", "back"]

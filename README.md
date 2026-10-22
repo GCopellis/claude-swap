@@ -190,6 +190,8 @@ Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usag
 
 The watch view (`w`, or `cswap watch`) also shows, under each account's bars, the tokens this machine's Claude Code spent inside that account's **current** 5h and 7d windows — `tokens  5h 12.30M (85.20K out)  ·  7d 99.78M (297.1K out)` — counted as in [Token usage](#token-usage), each window starting at its reset time minus 5 hours / 7 days. Counts refresh every 30 s; only the transcript bytes appended since the last pass are read.
 
+**Session history** (`h`, or the *Session history* menu entry) lists every 5h window of the last 30 days, per account, to compare them: start, end, messages, total and output tokens, the window's **peak** utilization, and **tokens per 1%** of the limit — how much work a percent bought. `t` switches to 7d windows, `a` filters by account, and the header shows per-account averages over closed windows. Peaks come from `cache/window_peaks.json`, which every usage reading (auto, list, TUI) now feeds with the highest percentage seen for each window; windows from before that file existed are estimated from the transcripts alone (marked `~`: opened by the first message after the previous window closed), with no peak.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Token usage
